@@ -1,0 +1,124 @@
+#include "select.h"
+
+void Select::sift_index_data(long long chunk_data_start, puint time_start,
+                             puint time_end, std::string msg_regex, IndexData& id, std::ifstream& ifs){
+    id.new_size = 0;
+    id.min_time = {0, 0};
+    id.max_time = PUINT_MAX;
+    ifs.seekg(id.data_start());
+    for(int i = 0; i < id.count; i++){
+        puint time;
+        readv(time.first, 4);
+        readv(time.second, 4);
+        int offset;
+        readv(offset, 4);
+        if(time <= time_end && time >= time_start){
+            std::streampos current_pos = ifs.tellg();
+            ifs.seekg((long long) offset + chunk_data_start); // go to the point
+            MessageData md;
+
+            md.skip_header(ifs);
+            readv(md.data_len, 4);
+            char* tmp = new char[md.data_len];
+            for(int j = 0; j < md.data_len; j++) readv(tmp[j], 1);
+            std::string msg_data_str = make_str(tmp);
+            std::regex rgx(msg_regex);
+            if(std::regex_search(msg_data_str.begin(), msg_data_str.end(), rgx)){
+                new_offset[offset] = 1;
+                id.new_size += md.data_len + md.header_len + 8;
+                id.new_count++;
+                if(time < id.min_time) id.min_time = time;
+                if(time > id.max_time) id.min_time = time;
+            }
+            ifs.seekg(current_pos);
+        }
+    }
+}
+
+
+void Select::make_map(puint time_start, puint time_end, std::string topic, bool topic_regex,
+                      std::string msg_regex, Chunk& c,
+                      std::map<int, Connection>& map_conn, std::ifstream& ifs){
+
+    c.new_index_data_size = c.ci.new_count = c.new_size = c.new_data_len = 0;
+    c.ci.new_start_time = PUINT_MAX;
+    c.ci.new_end_time = {0, 0};
+    for(std::map<int, IndexData>::iterator i = c.indexdata.begin(); i != c.indexdata.end(); i++){
+        IndexData& id = i->second;
+        id.new_size = id.new_count = 0;
+
+        // Делаем фильтрацию по топику
+
+        if(!topic_regex){
+            if(topic != map_conn[id.conn].topic && topic != "") continue;
+        } else{
+            std::regex rgx(topic);
+            if(!std::regex_search(map_conn[id.conn].topic.begin(), map_conn[id.conn].topic.end(), rgx)) continue;
+        }
+
+        // Прошли фильтрацию, продолжаем фильтровать но уже по другим параметрам (sift_index_data)
+
+        sift_index_data(c.data_start(), time_start, time_end, msg_regex, id, ifs);
+        id.new_data_len = id.new_count * 12;
+        //std::cout << "MAKE MAP: " << id.conn << " " << id.new_count << " " << id.new_data_len << " " << id.data_len << "\n";
+
+        // Пересчитываем информацию для ChunkInfo
+
+        if(id.new_count != 0){
+            c.ci.new_count++;
+            c.ci.new_start_time = std::min(c.ci.new_start_time, id.min_time);
+            c.ci.new_end_time = std::max(c.ci.new_end_time, id.max_time);
+            map_conn[id.conn].has_any_suitable_messages = true;
+        }
+        c.new_index_data_size += id.new_data_len + 8 + id.header_len;
+        c.new_data_len += id.new_size;
+    }
+}
+
+void sift_conn_in_chunk(Chunk& c, std::ifstream& ifs){
+    ifs.seekg(c.data_start());
+    while(ifs.tellg() < c.data_end()){
+        char op = read_op(ifs);
+        if(op == 0x07){
+            Connection con;
+            ifs >> con;
+            if(c.indexdata[con.conn].new_count != 0){
+                c.new_data_len += con.data_len + con.header_len + 8;
+            }
+        } else{
+            Record r;
+            r.skip_header(ifs);
+            r.skip_data(ifs);
+        }
+    }
+}
+
+void count_conns(BagFile& bf){
+    bf.bh.new_conn_count = 0;
+    for(std::map<int, Connection>::iterator i = bf.map_conn.begin(); i != bf.map_conn.end(); i++){
+        if(i->second.has_any_suitable_messages){
+            bf.bh.new_conn_count++;
+        }
+    }
+}
+
+
+void make_map(puint time_start, puint time_end, std::string topic, bool topic_regex,
+              std::string msg_regex, BagFile& bf, std::ifstream& ifs){
+    bf.bh.new_index_pos = bf.bh.data_end();
+    for(unsigned int i = 0; i < bf.chunks.size(); i++){
+        bf.chunks[i].ci.new_chunk_pos = bf.bh.new_index_pos;
+        Select s;
+        s.make_map(time_start, time_end, topic, topic_regex, msg_regex, bf.chunks[i], bf.map_conn, ifs);
+        bf.selects.push_back(s);
+        sift_conn_in_chunk(bf.chunks[i], ifs);
+        if(bf.chunks[i].ci.new_count != 0){
+            bf.bh.new_index_pos += bf.chunks[i].new_data_len + bf.chunks[i].header_len + 8 + bf.chunks[i].new_index_data_size;
+            bf.bh.new_chunk_count++;
+        }
+    }
+    count_conns(bf);
+}
+
+
+
